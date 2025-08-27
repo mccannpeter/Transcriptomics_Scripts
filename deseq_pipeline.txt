@@ -1,0 +1,459 @@
+########################################################################
+# DESeq2 RNA-seq Analysis Pipeline (R)
+# NOTE: All executable code below is copied verbatim from your original
+#       file. Only comments and whitespace were added for clarity.
+#
+# High-level steps:
+#  0) Set working directory
+#  1) Load libraries
+#  2) Import raw counts + metadata
+#  3) Group-wise zero-count prefilter (≥3 non-zeros in any group)
+#  4) Size-factor normalization (for Wilcoxon inputs)
+#  5) Build all pairwise comparisons
+#  6) Wilcoxon prefilter per comparison (CSV + histograms)
+#     → Combine significant genes across comparisons
+#  6a) Cook's distance outlier filtering
+#  7) DESeq2: LRT (all groups) and VST
+#  8) QC plots (PCA, distances, dispersions, MA, clustering, top-10 boxplot)
+#  7a–8) Wald fit and pairwise volcano plots
+#  9) Top 50 heatmap
+#  10) Per-condition upregulated gene lists for enrichment tools
+#  END) Session info
+#
+# Tips:
+#  - Ensure gene_counts.csv and Metadata.csv exist in the working dir.
+#  - Metadata must include a 'condition' column (factor).
+#  - Generated outputs: *_Wilcox*, *_DE_results.csv*, plots, heatmaps, etc.
+########################################################################
+
+# 0. Set working directory
+# =========================
+# 0) Choose the project working directory
+#    (affects where inputs are read & outputs written)
+# =========================
+setwd("/path/to/wd")
+
+# 1.a Load required libraries
+## Required R Packages
+`DESeq2, ggplot2, pheatmap, RColorBrewer, EnhancedVolcano, clusterProfiler, fgsea, msigdbr, WGCNA, dynamicTreeCut, reshape2`
+
+#Install via BiocManager/CRAN as needed, e.g.:
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("DESeq2","EnhancedVolcano","clusterProfiler","fgsea","msigdbr","WGCNA","pheatmap"))
+install.packages(c("ggplot2","RColorBrewer","reshape2"))
+````
+
+## Inputs
+
+* `gene_counts.csv` — genes × samples count matrix (rownames=gene IDs).
+* `Metadata.csv` — sample metadata; rownames must match column names of counts and include a `condition` column.
+
+# =========================
+# 1.b) Load required packages (CRAN/Bioconductor)
+# =========================
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(fgsea)
+library(msigdbr)
+library(WGCNA)
+library(dynamicTreeCut)
+library(reshape2)
+allowWGCNAThreads()  # optional
+
+# 2. Import data
+# =========================
+# 2) Import raw gene counts and sample metadata
+#    - Rows: genes; Columns: samples
+#    - Metadata must have rownames matching sample columns.
+# =========================
+raw_counts <- read.csv("gene_counts.csv", row.names = 1, check.names = FALSE)
+coldata    <- read.csv("Metadata.csv", row.names = 1)
+coldata$condition <- factor(coldata$condition)
+
+# 3. Initial group-based filter: keep genes with ≥3 non-zero counts in at least one condition group
+# =========================
+# 3) Prefilter by presence across groups
+#    Keep genes with ≥3 non-zero samples in at least one condition.
+# =========================
+conditions <- levels(coldata$condition)
+keep_gene <- apply(raw_counts, 1, function(counts_row) {
+  any(sapply(conditions, function(cond) {
+    sum(counts_row[coldata$condition == cond] > 0) >= 3
+  }))
+})
+cat(sprintf("Filtering genes: keeping %d/%d genes with ≥3 non-zero in at least one group\n", sum(keep_gene), nrow(raw_counts)))
+counts_zfilt <- raw_counts[keep_gene, ]
+write.csv(counts_zfilt, "Counts_FilteredByGroup.csv")
+
+# 4. Normalize counts for Wilcoxon pre-filter
+# =========================
+# 4) Normalize counts (size factors) to feed Wilcoxon tests
+# =========================
+dds_tmp     <- DESeqDataSetFromMatrix(countData = counts_zfilt,
+                                      colData   = coldata,
+                                      design    = ~ condition)
+dds_tmp     <- estimateSizeFactors(dds_tmp)
+norm_counts <- counts(dds_tmp, normalized = TRUE)
+
+# 5. Generate all pairwise comparisons from metadata
+# =========================
+# 5) Enumerate all pairwise condition comparisons
+# =========================
+groups    <- levels(coldata$condition)
+pair_mat  <- t(combn(groups, 2))
+pair_list <- setNames(split(pair_mat, seq_len(nrow(pair_mat))),
+                      apply(pair_mat, 1, paste, collapse = "_vs_"))
+
+# 6. Wilcoxon pre-filter for each comparison
+# =========================
+# 6) Wilcoxon prefilter per pairwise comparison
+#    - Writes per-comparison CSV & p-value histograms.
+#    - Collects p<0.05 genes to carry into DESeq2.
+# =========================
+gene_sig_wilcox <- vector("list", length(pair_list))
+names(gene_sig_wilcox) <- names(pair_list)
+
+for (pair_name in names(pair_list)) {
+  grps <- pair_list[[pair_name]]
+  idx1 <- which(coldata$condition == grps[1])
+  idx2 <- which(coldata$condition == grps[2])
+  
+  if (length(idx1) == 0 || length(idx2) == 0) {
+    stop(sprintf("Group mismatch: cannot find samples for groups '%s' or '%s'", grps[1], grps[2]))
+  }
+  
+  pvals <- apply(norm_counts, 1, function(x) {
+    wilcox.test(x[idx1], x[idx2], exact = FALSE)$p.value
+  })
+  padj  <- p.adjust(pvals, method = "BH")
+  
+  wilcox_df <- data.frame(
+    gene   = rownames(counts_zfilt),
+    pvalue = pvals,
+    padj   = padj,
+    stringsAsFactors = FALSE
+  )
+  write.csv(wilcox_df, paste0(pair_name, "_WilcoxPreFilter.csv"), row.names = FALSE)
+  
+  samples1 <- colnames(norm_counts)[idx1]
+  samples2 <- colnames(norm_counts)[idx2]
+  input_mat <- norm_counts[, c(samples1, samples2), drop = FALSE]
+  inspect_genes <- head(rownames(input_mat), 5)
+  cat(sprintf("Inspecting normalized counts (genes %s) for comparison %s (groups: %s vs %s):\n",
+              paste(inspect_genes, collapse = ", "),
+              pair_name, grps[1], grps[2]))
+  print(input_mat[inspect_genes, ])
+  write.csv(input_mat,
+            paste0(pair_name, "_WilcoxInput_NormCounts.csv"),
+            quote = FALSE)
+  
+  cat(sprintf("P-value summary for %s:\n", pair_name))
+  print(summary(pvals))
+  cat(sprintf("Adjusted p-value summary for %s:\n", pair_name))
+  print(summary(padj))
+  png(paste0(pair_name, "_Wilcox_PvalueHist.png"))
+  hist(pvals, main=paste(pair_name, "raw p-values"), xlab="p-value")
+  dev.off()
+  png(paste0(pair_name, "_Wilcox_PadjHist.png"))
+  hist(padj, main=paste(pair_name, "adjusted p-values"), xlab="padj")
+  dev.off()
+  
+  sig_genes <- wilcox_df$gene[wilcox_df$pvalue < 0.05]
+  gene_sig_wilcox[[pair_name]] <- sig_genes
+  cat(sprintf("%s: %d genes passed Wilcoxon p<0.05\n", pair_name, length(sig_genes)))
+  cat("---------------------------------------------------------\n")
+}
+
+# Combine all Wilcoxon-significant genes
+# ----- Combine Wilcoxon-significant genes across comparisons -----
+# (no code changes below)
+to_keep <- unique(unlist(gene_sig_wilcox))
+to_keep <- intersect(rownames(counts_zfilt), to_keep)
+counts_pfilt <- counts_zfilt[to_keep, , drop = FALSE]
+na_genes <- rownames(counts_pfilt)[apply(is.na(counts_pfilt), 1, any)]
+if (length(na_genes) > 0) {
+  warning(sprintf("Removing %d genes with NA counts during prefilter: %s",
+                  length(na_genes), paste(na_genes, collapse = ", ")))
+  counts_pfilt <- counts_pfilt[!rownames(counts_pfilt) %in% na_genes, , drop = FALSE]
+}
+write.csv(counts_pfilt, "Counts_WilcoxFiltered.csv")
+cat(sprintf("Total pre-filter genes after NA removal: %d\n", nrow(counts_pfilt)))
+write.csv(counts_pfilt, "Counts_WilcoxFiltered.csv")
+cat(sprintf("Total pre-filter genes: %d\n", nrow(counts_pfilt)))
+
+# 6a. Cook’s-distance outlier filtering on Wilcoxon-filtered counts
+# =========================
+# 6a) Cook's Distance filtering to remove outlier-influenced genes
+# =========================
+# build a temporary DESeqDataSet
+dds_cd <- DESeqDataSetFromMatrix(countData = counts_pfilt,
+                                 colData   = coldata,
+                                 design    = ~ condition)
+
+# estimate size factors & dispersions, fit GLM so we can extract cooks
+dds_cd <- estimateSizeFactors(dds_cd)
+dds_cd <- estimateDispersions(dds_cd)
+dds_cd <- nbinomWaldTest(dds_cd)
+
+# extract Cook’s distances and set threshold at the 99th-percentile F-dist
+cds    <- assays(dds_cd)[["cooks"]]
+thresh <- qf(0.99, df1 = ncol(dds_cd) - 1, df2 = Inf)
+
+# identify & drop any gene with Cook’s > thresh in any sample
+bad_genes <- rownames(cds)[apply(cds > thresh, 1, any)]
+message(length(bad_genes), " genes exceed Cook’s D threshold; removing before DESeq")
+counts_pfilt <- counts_pfilt[!rownames(counts_pfilt) %in% bad_genes, ]
+write.csv(bad_genes, "CookD_flagged_genes.csv", row.names = FALSE)
+
+# 7. DESeq2 on Wilcoxon-filtered counts
+# =========================
+# 7) Run DESeq2 on prefiltered counts
+# =========================
+dds <- DESeqDataSetFromMatrix(countData = counts_pfilt,
+                              colData   = coldata,
+                              design    = ~ condition)
+dds <- dds[rowSums(counts(dds)) > 10, ]
+
+# 7a. Likelihood Ratio Test (LRT) across all conditions
+# ----- Global differential signal across all groups (LRT) -----
+dds_lrt <- DESeq(dds, test = "LRT", reduced = ~ 1)
+res_lrt <- results(dds_lrt)
+write.csv(as.data.frame(res_lrt), "DESeq2_LRT_Results_AllGroups.csv")
+
+# 7b. Variance Stabilizing Transformation (VST)
+# ----- Variance Stabilizing Transformation (VST) for visualization -----
+vsd <- vst(dds, blind = FALSE)
+write.csv(assay(vsd), "VST_NormalizedCounts.csv")
+
+# 8. QC and Exploratory Plots (All Groups)
+# =========================
+# 8) QC & exploratory plotting
+# =========================
+## a. PCA Plot
+# --- PCA of VST-transformed data ---
+pcaData <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p_all <- ggplot(pcaData, aes(PC1, PC2, color = condition)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("PCA of All Samples") +
+  theme_minimal()
+pdf("PCA_plot_AllGroups.pdf", width = 7, height = 7)
+print(p_all)
+dev.off()
+
+## b. Sample Distance Heatmap
+# --- Sample distance heatmap ---
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- colnames(vsd)
+colnames(sampleDistMatrix) <- colnames(vsd)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         main = "Sample Distance Matrix (All Groups)",
+         filename = "Sample_Distance_Heatmap_AllGroups.pdf")
+
+## c. Dispersion Plot
+# --- Dispersion diagnostics ---
+pdf("Dispersion_Plot_AllGroups.pdf", width = 7, height = 7)
+plotDispEsts(dds_lrt)
+dev.off()
+
+## d. MA Plot
+# --- MA plot ---
+pdf("MA_Plot_AllGroups.pdf", width = 7, height = 7)
+plotMA(res_lrt, ylim = c(-5, 5), main = "MA Plot (All Groups)")
+dev.off()
+
+## e. Hierarchical Clustering Dendrogram
+# --- Clustering dendrogram ---
+hc_all <- hclust(sampleDists, method = "average")
+pdf("Hierarchical_Clustering_Dendrogram_AllGroups.pdf", width = 7, height = 7)
+plot(hc_all, main = "Hierarchical Clustering of All Samples", xlab = "", sub = "")
+dev.off()
+
+## f) Boxplot top10 (numeric labels)
+# --- Top 10 genes boxplot ---
+deg_all <- res_lrt[order(res_lrt$padj), ]
+t10 <- rownames(deg_all)[1:10]
+label_map_all <- data.frame(Label = 1:10, Gene = t10, stringsAsFactors = FALSE)
+write.csv(label_map_all, "Top10_GeneLabel_Map_AllGroups.csv", row.names = FALSE)
+mat_top10 <- assay(vsd)[t10, , drop = FALSE]
+df_box <- melt(mat_top10)
+colnames(df_box) <- c("Gene", "Sample", "Expression")
+df_box$Condition <- colData(vsd)$condition[df_box$Sample]
+df_box$Label <- factor(match(df_box$Gene, t10), levels = 1:10)
+p_box10 <- ggplot(df_box, aes(x = Label, y = Expression, fill = Condition)) +
+  geom_boxplot(position = position_dodge(0.8)) +
+  scale_x_discrete(labels = 1:10) +
+  xlab("Top 10 Genes (by rank)") +
+  ylab("VST Expression") +
+  theme_minimal()
+pdf("Boxplot_Top10_AllGroups.pdf", width = 10, height = 5)
+print(p_box10)
+dev.off()
+
+# 7a. Wald test for pairwise comparisons
+# =========================
+# 7a) Fit Wald model for standard pairwise DE testing
+# =========================
+# This fits the default negative binomial model
+ddsWald <- DESeq(dds)
+
+# 7b. Likelihood Ratio Test (LRT) across all conditions
+# (Re-runs LRT on the Wald-fitted object)
+# Use the same size factors and dispersions
+dds_lrt <- DESeq(dds, test = "LRT", reduced = ~ 1)
+res_lrt <- results(dds_lrt)
+write.csv(as.data.frame(res_lrt), "DESeq2_LRT_Results_AllGroups.csv")
+
+# 7c. Variance Stabilizing Transformation (VST) on Wald-fitted model
+# (VST on Wald-fitted object for consistency)
+vsd <- vst(ddsWald, blind = FALSE)
+write.csv(assay(vsd), "VST_NormalizedCounts.csv")
+
+# 7d. QC and Exploratory Plots for all groups
+# (Optional: PCA, heatmap, dispersion, MA, volcano, clustering, boxplot)
+# [omitted here unless needed]
+
+# 8. Pairwise DE results & volcano plots
+# =========================
+# 8) Pairwise DE: write tables and volcano plots per contrast
+# =========================
+# Generate pairwise DE results and volcano plots using Wald test model (ddsWald)
+pair_list <- combn(conditions, 2, FUN = function(x) x, simplify = FALSE)
+names(pair_list) <- sapply(pair_list, paste, collapse = "_vs_")
+for (pair in names(pair_list)) {
+  grps <- pair_list[[pair]]
+  # contrast: second vs first
+  res <- results(ddsWald, contrast = c("condition", grps[2], grps[1]))
+  
+  # Save DE result table
+  res_df <- as.data.frame(res)
+  res_df$Gene <- rownames(res_df)
+  write.csv(res_df[, c("Gene","log2FoldChange","pvalue","padj")],
+            paste0(pair, "_DE_results.csv"), row.names=FALSE)
+  
+  # Count significant genes
+  up   <- sum(res$log2FoldChange >= 2  & res$pvalue < 0.05, na.rm=TRUE)
+  down <- sum(res$log2FoldChange <= -2 & res$pvalue < 0.05, na.rm=TRUE)
+  tot  <- up + down
+  
+  # Volcano plot
+  png(paste0(pair, "_Volcano.png"), width=2000, height=2000, res=300)
+  p <- EnhancedVolcano(res,
+                       lab=NA,
+                       x="log2FoldChange",
+                       y="pvalue",
+                       pCutoff=0.05,
+                       FCcutoff=2,
+                       title=pair,
+                       subtitle=paste0("Up: ",up," | Down: ",down," | Tot: ",tot))
+  print(p)
+  dev.off()
+}
+
+# 9a. Select top 50 genes by adjusted p-value (drop NA padj)
+# =========================
+# 9) Top 50 DE genes heatmap
+# =========================
+res_df_all <- as.data.frame(res_lrt)
+res_df_all <- res_df_all[!is.na(res_df_all$padj), ]
+top50      <- rownames(res_df_all[order(res_df_all$padj), ])[1:50]
+
+# 9b. Extract VST counts and z-score each gene (row-wise)
+mat    <- assay(vsd)[top50, ]
+mat_z  <- t(scale(t(mat)))
+rownames(mat_z) <- top50
+
+# 9c. Build column annotation for the three conditions
+annotation_col <- data.frame(
+  Condition = coldata[colnames(mat_z), "condition"]
+)
+rownames(annotation_col) <- colnames(mat_z)
+
+# 9d′. Save heatmap directly via pheatmap
+pheatmap(mat_z,
+         annotation_col          = annotation_col,
+         show_rownames          = TRUE,
+         show_colnames          = FALSE,
+         clustering_method      = "complete",
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         main = "Top 50 DEGs Across All Conditions",
+         filename = "Top50_DEGs_Heatmap.png",
+         width    = 12,    # width in inches
+         height   = 16,   # height in inches
+         res      = 600)  # dpi
+
+#Prepare gene lists for ShinyGO and Stringdb
+# =========================
+# 10) Prepare per-condition upregulated gene lists
+#     for ShinyGO / STRINGdb enrichment tools
+# =========================
+# === Prepare per‐condition up‐regulated gene lists (|log2FC| ≥ 2, p < 0.05) ===
+
+de_files     <- list.files(pattern = "_DE_results\\.csv$")
+conds        <- levels(coldata$condition)
+fc_threshold <- 2
+p_threshold  <- 0.05
+
+for (cond in conds) {
+  cond_hits <- data.frame()
+  
+  for (f in de_files) {
+    base  <- sub("_DE_results\\.csv$", "", f)
+    parts <- strsplit(base, "_vs_")[[1]]
+    A     <- parts[1]; B <- parts[2]
+    
+    df <- read.csv(f, stringsAsFactors = FALSE, check.names = FALSE)
+    # ensure a Gene column
+    if (!"Gene" %in% colnames(df)) {
+      df$Gene <- rownames(df)
+    }
+    
+    # pick up‐regulation in `cond`
+    if (cond == B) {
+      df_sub <- subset(df,
+                       log2FoldChange >=  fc_threshold &
+                         pvalue         <   p_threshold)
+    }
+    else if (cond == A) {
+      df_sub <- subset(df,
+                       log2FoldChange <= -fc_threshold &
+                         pvalue         <   p_threshold)
+    }
+    else next
+    
+    if (nrow(df_sub) > 0) {
+      df_sub$Comparison <- base
+      df_sub$UpIn       <- cond
+      cond_hits <- rbind(
+        cond_hits,
+        df_sub[, c("Gene","log2FoldChange","pvalue","padj","Comparison","UpIn")]
+      )
+    }
+  }
+  
+  out_file <- paste0(cond, "_up_genes_fc1_p05.csv")
+  write.csv(cond_hits, file = out_file, row.names = FALSE)
+  message(sprintf("%s: %d genes → %s", cond, nrow(cond_hits), out_file))
+}
+
+# END
+# =========================
+# END: record session info for reproducibility
+# =========================
+writeLines(capture.output(sessionInfo()), "sessionInfo.txt")
+````
+
+---
+
+
